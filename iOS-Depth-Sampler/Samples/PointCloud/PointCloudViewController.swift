@@ -11,6 +11,7 @@ import Photos
 import SceneKit
 import Accelerate
 import SwiftAssetsPickerController
+import VideoToolbox
 
 class PointCloudlViewController: UIViewController {
 
@@ -18,6 +19,7 @@ class PointCloudlViewController: UIViewController {
     @IBOutlet weak var typeSegmentedCtl: UISegmentedControl!
     
     private var image: UIImage?
+    private var cgImage: CGImage?
     private var depthData: AVDepthData?
     
     @IBOutlet weak var scnView: SCNView!
@@ -27,9 +29,16 @@ class PointCloudlViewController: UIViewController {
     private var pointCloudNode: SCNNode?
     
     private let zCamera: Float = -0.1
+    private var videoCapture: VideoCapture!
+    private let serialQueue = DispatchQueue(label: "com.depth.transformation")
+    private var currentDrawableSize: CGSize!
+    private var cloudPointCreated = false
     
     override func viewDidLoad() {
         super.viewDidLoad()
+
+        self.scnView.isHidden = false
+        setupVideo()
         
         setupScene()
         
@@ -45,12 +54,69 @@ class PointCloudlViewController: UIViewController {
         
         update()
     }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        guard let videoCapture = videoCapture else {return}
+        videoCapture.startCapture()
+
+        // Run the session with the configuration
+        // **Does not work together with video capture**
+        //self.sceneView.session.run(self.sceneConfiguration)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        guard let videoCapture = videoCapture else {return}
+        videoCapture.resizePreview()
+
+        self.currentDrawableSize = self.imageView.frame.size
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        guard let videoCapture = videoCapture else {return}
+        videoCapture.imageBufferHandler = nil
+        videoCapture.stopCapture()
+        super.viewWillDisappear(animated)
+    }
+
+    private func create(pixelBuffer: CVPixelBuffer) -> CGImage? {
+      var cgImage: CGImage?
+      VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &cgImage)
+      return cgImage
+    }
+
+    private func setupVideo() {
+        // Depth camera capturing. The depth data is not available for wide angle camera.
+        videoCapture = VideoCapture(cameraType: .back(true), // true means that depth data is presented
+                                    preferredSpec: nil,
+                                    previewContainer: imageView.layer)
+
+        videoCapture.syncedDataBufferHandler = { [weak self] videoPixelBuffer, depthData, face in
+            guard let self = self else { return }
+
+            //if !self.cloudPointCreated {
+                self.cloudPointCreated = true
+                self.depthData = depthData
+                self.cgImage = self.create(pixelBuffer: videoPixelBuffer)
+                self.drawPointCloud()
+            //}
+
+            self.serialQueue.async {
+                guard let videoCIImage = videoPixelBuffer.transformedImage(targetSize: self.currentDrawableSize, rotationAngle: 0.0) else {
+
+                    return
+                }
+            }
+        }
+        videoCapture.setDepthFilterEnabled(true)
+    }
     
     private func setupScene() {
         scnView.scene = scene
         scnView.allowsCameraControl = true
         scnView.showsStatistics = true
-        scnView.backgroundColor = UIColor.black
+        scnView.backgroundColor = UIColor.clear
         
         let cameraNode = SCNNode()
         let camera = SCNCamera()
@@ -114,12 +180,12 @@ class PointCloudlViewController: UIViewController {
     }
     
     private func drawPointCloud() {
-        guard let colorImage = image, let cgColorImage = colorImage.cgImage else { return }
+        guard let cgColorImage = self.cgImage else { return }
         guard let depthData = depthData else { return }
         
         let depthPixelBuffer = depthData.depthDataMap
         let depthWidth  = CVPixelBufferGetWidth(depthPixelBuffer)
-        let resizeScale = CGFloat(depthWidth) / CGFloat(colorImage.size.width)
+        let resizeScale = CGFloat(depthWidth) / CGFloat(cgColorImage.width)
         let resizedColorImage = CIImage(cgImage: cgColorImage).transformed(by: CGAffineTransform(scaleX: resizeScale, y: resizeScale))
         guard let pixelDataColor = resizedColorImage.createCGImage().pixelData() else { fatalError() }
         
@@ -143,7 +209,8 @@ class PointCloudlViewController: UIViewController {
                 reducedColors.append(pixelDataColor[$0 * 4 + 3])
             }
         }
-        
+
+        pointCloudNode?.removeFromParentNode()
         // Draw as a custom geometry
         let pc = PointCloud()
         //        pc.points = points
@@ -152,25 +219,28 @@ class PointCloudlViewController: UIViewController {
         pc.colors = reducedColors
         let pcNode = pc.pointCloudNode()
         pcNode.position = SCNVector3(x: 0, y: 0, z: 0)
-        scene.rootNode.addChildNode(pcNode)
+
+        DispatchQueue.main.async {
+            self.scene.rootNode.addChildNode(pcNode)
+        }
         
         pointCloud = pc
         pointCloudNode = pcNode
     }
     
     private func update() {
-        pointCloudNode?.removeFromParentNode()
+//        pointCloudNode?.removeFromParentNode()
         
-        switch typeSegmentedCtl.selectedSegmentIndex {
-        case 0:
-            scnView.isHidden = true
-            drawImage(image)
-        case 1:
-            scnView.isHidden = false
-            drawPointCloud()
-        default:
-            fatalError()
-        }
+//        switch typeSegmentedCtl.selectedSegmentIndex {
+//        case 0:
+//            scnView.isHidden = true
+//            drawImage(image)
+//        case 1:
+//            scnView.isHidden = false
+//            drawPointCloud()
+//        default:
+//            fatalError()
+//        }
     }
     
     // MARK: - Actions
@@ -223,27 +293,36 @@ extension CVPixelBuffer {
         let height = CVPixelBufferGetHeight(self)
         var pixelData = [Float32](repeating: 0, count: Int(width * height))
         let baseAddress = CVPixelBufferGetBaseAddress(self)!
-        guard
-            CVPixelBufferGetPixelFormatType(self) == kCVPixelFormatType_DepthFloat16 ||
-                CVPixelBufferGetPixelFormatType(self) == kCVPixelFormatType_DisparityFloat16
-            else { fatalError() }
 
-        // Float16という型がない（Floatは32bit）ので、UInt16として読み出す
-        let data = UnsafeMutableBufferPointer<UInt16>(start: baseAddress.assumingMemoryBound(to: UInt16.self), count: width * height)
-        for yMap in 0 ..< height {
-            for index in 0 ..< width {
-                let baseAddressIndex = index + yMap * width
-                // UInt16として読みだした値をFloat32に変換する
-                var f16Pixel = data[baseAddressIndex]  // Read as UInt16
-                var f32Pixel = Float32(0.0)
-                var src = vImage_Buffer(data: &f16Pixel, height: 1, width: 1, rowBytes: 2)
-                var dst = vImage_Buffer(data: &f32Pixel, height: 1, width: 1, rowBytes: 4)
-                vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
-                
-                // Float32の配列に格納
-                pixelData[baseAddressIndex] = f32Pixel
+        if CVPixelBufferGetPixelFormatType(self) == kCVPixelFormatType_DepthFloat16 ||
+            CVPixelBufferGetPixelFormatType(self) == kCVPixelFormatType_DisparityFloat16 {
+            // Float16という型がない（Floatは32bit）ので、UInt16として読み出す
+            pixelData = [Float32](repeating: 0, count: Int(width * height))
+            let data = UnsafeMutableBufferPointer<UInt16>(start: baseAddress.assumingMemoryBound(to: UInt16.self), count: width * height)
+
+            for yMap in 0 ..< height {
+                for index in 0 ..< width {
+                    let baseAddressIndex = index + yMap * width
+                    // UInt16として読みだした値をFloat32に変換する
+                    var f16Pixel = data[baseAddressIndex]  // Read as UInt16
+                    var f32Pixel = Float32(0.0)
+                    var src = vImage_Buffer(data: &f16Pixel, height: 1, width: 1, rowBytes: 2)
+                    var dst = vImage_Buffer(data: &f32Pixel, height: 1, width: 1, rowBytes: 4)
+                    vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+
+                    // Float32の配列に格納
+                    pixelData[baseAddressIndex] = f32Pixel
+                }
             }
+        } else if CVPixelBufferGetPixelFormatType(self) == kCVPixelFormatType_DepthFloat32 ||
+            CVPixelBufferGetPixelFormatType(self) == kCVPixelFormatType_DisparityFloat32 {
+
+            let floatPointer = unsafeBitCast(CVPixelBufferGetBaseAddress(self), to: UnsafeMutablePointer<Float32>.self)
+            pixelData = Array(UnsafeBufferPointer(start: floatPointer, count: Int(width * height)))
+        } else {
+            fatalError("Unexpected pixel format")
         }
+
         CVPixelBufferUnlockBaseAddress(self, CVPixelBufferLockFlags(rawValue: 0))
         return pixelData
     }
